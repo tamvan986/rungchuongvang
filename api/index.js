@@ -1,0 +1,22 @@
+import crypto from 'node:crypto';
+const URL_BASE=process.env.SUPABASE_URL?.replace(/\/$/,'');
+const KEY=process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SIGN=process.env.SESSION_SECRET;
+const sample=[
+{text:'Cho hàm số f(x) = x² − 4x + 3. Giá trị nhỏ nhất của hàm số là?',options:['−1','1','0','3'],answer:0,time:15},
+{text:'Tam giác ABC vuông tại A, AB = 3, AC = 4. Độ dài BC bằng?',options:['5','6','7','√7'],answer:0,time:15},
+{text:'Đạo hàm của hàm số y = x³ là?',options:['x²','3x²','3x','x³'],answer:1,time:15},
+{text:'Nghiệm của phương trình 2x + 6 = 0 là?',options:['3','−2','−3','6'],answer:2,time:15},
+{text:'Giá trị của log₂8 là?',options:['2','4','3','8'],answer:2,time:15}
+];
+function token(payload){const data=Buffer.from(JSON.stringify({...payload,exp:Date.now()+1000*60*60*24})).toString('base64url');return data+'.'+crypto.createHmac('sha256',SIGN).update(data).digest('base64url')}
+function verify(t){if(!t||typeof t!=='string')throw Error('Phiên đăng nhập không hợp lệ');let [data,sig]=t.split('.');if(!data||!sig)throw Error('Phiên đăng nhập không hợp lệ');const expected=crypto.createHmac('sha256',SIGN).update(data).digest();const actual=Buffer.from(sig,'base64url');if(actual.length!==expected.length||!crypto.timingSafeEqual(actual,expected))throw Error('Phiên đăng nhập không hợp lệ');const p=JSON.parse(Buffer.from(data,'base64url').toString());if(p.exp<Date.now())throw Error('Phiên đã hết hạn');return p}
+async function db(fn,args){const r=await fetch(`${URL_BASE}/rest/v1/rpc/${fn}`,{method:'POST',headers:{apikey:KEY,Authorization:`Bearer ${KEY}`,'Content-Type':'application/json'},body:JSON.stringify(args)});const txt=await r.text();if(!r.ok)throw Error((()=>{try{return JSON.parse(txt).message}catch{return txt.slice(0,180)}})());return txt?JSON.parse(txt):null}
+function validQuestions(value){if(!Array.isArray(value)||!value.length||value.length>100)throw Error('Cần 1–100 câu hỏi');return value.map(x=>{if(typeof x?.text!=='string'||!x.text.trim()||!Array.isArray(x.options)||x.options.length!==4||x.options.some(o=>typeof o!=='string'||!o.trim())||!Number.isInteger(x.answer)||x.answer<0||x.answer>3||!Number.isFinite(Number(x.time)))throw Error('Định dạng câu hỏi không hợp lệ');return {text:x.text.slice(0,1000),options:x.options.map(o=>o.slice(0,250)),answer:x.answer,time:Math.max(5,Math.min(180,Math.floor(Number(x.time)||15)))}})}
+export default async function handler(req,res){res.setHeader('Cache-Control','no-store');if(!URL_BASE||!KEY||!SIGN||SIGN.length<32)return res.status(503).json({error:'Thiếu cấu hình SUPABASE_URL, SUPABASE_SECRET_KEY, SESSION_SECRET (ít nhất 32 ký tự)'});if(req.method!=='POST')return res.status(405).json({error:'Chỉ hỗ trợ POST'});try{const {action,code,name,session,choice,value}=req.body||{};let result;
+if(action==='create'){const hostKey=crypto.randomBytes(24).toString('hex');result=await db('rcv_create',{p_host_key:hostKey,p_questions:sample});return res.json({ok:true,code:result,session:token({role:'host',code:result,key:hostKey})})}
+if(action==='join'){if(!/^\d{6}$/.test(String(code||''))||typeof name!=='string'||!name.trim()||name.trim().length>50)throw Error('Mã phòng hoặc tên không hợp lệ');const id=crypto.randomUUID();result=await db('rcv_join',{p_code:String(code),p_name:name.trim(),p_id:id});return res.json({ok:true,id:result.id,number:result.number,session:token({role:'student',code:String(code),id:result.id})})}
+const auth=verify(session);if(action==='state'){result=await db('rcv_state',{p_code:auth.code,p_role:auth.role,p_student_id:auth.id||null,p_host_key:auth.key||null});return res.json({ok:true,state:result})}
+if(action==='submit'){if(auth.role!=='student'||!Number.isInteger(choice)||choice<0||choice>3)throw Error('Đáp án không hợp lệ');result=await db('rcv_submit',{p_code:auth.code,p_id:auth.id,p_choice:choice});return res.json({ok:true})}
+if(action==='host'){if(auth.role!=='host')throw Error('Không có quyền điều khiển');if(!['start','pause','resume','finish','rescue','reset','setQuestions'].includes(value?.action))throw Error('Lệnh không hợp lệ');const questions=value.action==='setQuestions'?validQuestions(value.questions):null;await db('rcv_host_action',{p_code:auth.code,p_host_key:auth.key,p_action:value.action,p_questions:questions});return res.json({ok:true})}
+throw Error('Yêu cầu không hợp lệ');}catch(e){return res.status(400).json({error:e.message||'Có lỗi xảy ra'})}}
